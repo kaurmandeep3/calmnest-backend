@@ -13,6 +13,7 @@ from openai import OpenAI
 
 from database import engine, SessionLocal
 from models import DailyEntry
+import random
 
 # --------------------------------------------------
 # App setup
@@ -55,6 +56,23 @@ def notify_history_update():
 # --------------------------------------------------
 # Models
 # --------------------------------------------------
+def get_quick_guidance():
+    messages = [
+        "Some days naturally include more screen time than planned, and that’s okay. "
+        "A calmer wind-down tomorrow evening may help your child settle more easily.",
+
+        "Screen time ebbs and flows from day to day. What matters most is the overall rhythm, "
+        "not a single moment.",
+
+        "It sounds like today was full. Tomorrow can be gentler, and small adjustments really do help.",
+
+        "There’s no single right balance — just what fits your family today. "
+        "You’re paying attention, and that matters.",
+
+        "Every family has days that look different than expected. "
+        "Pausing and noticing is already a positive step."
+    ]
+    return random.choice(messages)
 
 class DailyGuidanceRequest(BaseModel):
     age: int
@@ -89,11 +107,7 @@ def get_daily_guidance(data: DailyGuidanceRequest):
     AI reflection runs asynchronously and updates History later.
     """
 
-    quick_guidance = (
-        "Some days naturally include more screen time than planned, and that’s okay. "
-        "A calmer wind-down tomorrow evening may help your child settle more easily. "
-        "You’re doing your best — small adjustments really do help."
-    )
+    quick_guidance = get_quick_guidance()
 
     # Save immediately
     db = SessionLocal()

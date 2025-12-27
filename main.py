@@ -9,6 +9,9 @@ from models import DailyEntry
 from typing import List
 from pydantic import BaseModel
 from datetime import date
+import threading
+from typing import Optional
+
 
 
 # Load environment variables
@@ -54,29 +57,64 @@ class HistoryItem(BaseModel):
 @app.post("/daily-guidance")
 def get_daily_guidance(data: DailyGuidanceRequest):
 
-    # 1️⃣ Generate guidance (example text for now)
-    guidance_text = (
-        "Some days naturally include more screen time, and that’s okay. "
-        "A calmer wind-down tomorrow evening may help your child settle more easily."
-        "You’re doing your best, and small adjustments really do help."
+    # 1️⃣ Instant, calm baseline guidance
+    quick_guidance = (
+        "Some days naturally include more screen time than planned, and that’s okay. "
+        "A calmer wind-down tomorrow evening may help your child settle more easily. "
+        "You’re doing your best — small adjustments really do help."
     )
 
-    # 2️⃣ SAVE ENTRY TO DATABASE  ✅ THIS IS THE PART YOU ASKED ABOUT
+    # 2️⃣ Save immediately
     db = SessionLocal()
     entry = DailyEntry(
         age=data.age,
         screen_minutes=data.screen_minutes,
         evening_usage=data.evening_usage,
-        guidance=guidance_text,
+        guidance=quick_guidance,
     )
     db.add(entry)
     db.commit()
+    db.refresh(entry)
     db.close()
 
-    # 3️⃣ Return response to frontend
-    return {
-        "guidance": guidance_text
-    }
+    if data.age <= 6 and data.screen_minutes < 60:
+        return {"guidance": quick_guidance}
+    
+    # 3️⃣ Run OpenAI in background (non-blocking)
+    threading.Thread(
+        target=generate_ai_guidance_async,
+        args=(entry.id, data),
+        daemon=True,
+    ).start()
+
+    # 4️⃣ Respond instantly
+    return {"guidance": quick_guidance}
+def generate_ai_guidance_async(entry_id: int, data: DailyGuidanceRequest):
+    try:
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=(
+                f"Give gentle, non-judgmental parenting guidance for a "
+                f"{data.age}-year-old child who had {data.screen_minutes} "
+                f"minutes of screen time today. "
+                f"Evening screen usage: {data.evening_usage}. "
+                f"Tone: calm, reassuring, brief (3–4 sentences)."
+            ),
+        )
+
+        ai_text = response.output_text
+
+        db = SessionLocal()
+        entry = db.query(DailyEntry).get(entry_id)
+
+        if entry:
+            entry.guidance = ai_text
+            db.commit()
+
+        db.close()
+
+    except Exception as e:
+        print("AI background task failed:", e)
 @app.get("/history", response_model=List[HistoryItem])
 def get_history():
     db = SessionLocal()

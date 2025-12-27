@@ -1,28 +1,31 @@
 from fastapi import FastAPI
-from pydantic import BaseModel
-import os
-from dotenv import load_dotenv
-from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
-from database import engine, SessionLocal
-from models import DailyEntry
-from typing import List
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from typing import List
 from datetime import date
 import threading
-from typing import Optional
+import os
+import time
 
+from dotenv import load_dotenv
+from openai import OpenAI
 
+from database import engine, SessionLocal
+from models import DailyEntry
 
-# Load environment variables
+# --------------------------------------------------
+# App setup
+# --------------------------------------------------
+
 load_dotenv()
 
-# Initialize app
 app = FastAPI(
-    title="Calm Screen Companion API",
-    description="Gentle screen-time guidance for children aged 3–6",
-    version="1.0"
+    title="CalmNest API",
+    description="Gentle screen-time guidance for children",
+    version="1.0",
 )
+
 DailyEntry.__table__.create(bind=engine, checkfirst=True)
 
 app.add_middleware(
@@ -33,19 +36,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize OpenAI client
-print(os.getenv("OPENAI_API_KEY"))
+# --------------------------------------------------
+# OpenAI client
+# --------------------------------------------------
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Request model
+# --------------------------------------------------
+# Simple in-memory notifier (safe for v1)
+# --------------------------------------------------
+
+history_updated = False
+
+def notify_history_update():
+    global history_updated
+    history_updated = True
+
+# --------------------------------------------------
+# Models
+# --------------------------------------------------
+
 class DailyGuidanceRequest(BaseModel):
     age: int
     screen_minutes: int
     evening_usage: bool
 
-# Response model
+
 class DailyGuidanceResponse(BaseModel):
     guidance: str
+
 
 class HistoryItem(BaseModel):
     entry_date: date
@@ -54,17 +73,29 @@ class HistoryItem(BaseModel):
     guidance: str
 
 
-@app.post("/daily-guidance")
-def get_daily_guidance(data: DailyGuidanceRequest):
+# --------------------------------------------------
+# Routes
+# --------------------------------------------------
 
-    # 1️⃣ Instant, calm baseline guidance
+@app.get("/")
+def health_check():
+    return {"status": "CalmNest API running"}
+
+
+@app.post("/daily-guidance", response_model=DailyGuidanceResponse)
+def get_daily_guidance(data: DailyGuidanceRequest):
+    """
+    Instant baseline guidance.
+    AI reflection runs asynchronously and updates History later.
+    """
+
     quick_guidance = (
         "Some days naturally include more screen time than planned, and that’s okay. "
         "A calmer wind-down tomorrow evening may help your child settle more easily. "
         "You’re doing your best — small adjustments really do help."
     )
 
-    # 2️⃣ Save immediately
+    # Save immediately
     db = SessionLocal()
     entry = DailyEntry(
         age=data.age,
@@ -77,18 +108,69 @@ def get_daily_guidance(data: DailyGuidanceRequest):
     db.refresh(entry)
     db.close()
 
+    # --------------------------------------------------
+    # SMART SKIP RULES (AI runs more often)
+    # --------------------------------------------------
+
+    if data.screen_minutes < 30:
+        return {"guidance": quick_guidance}
+
     if data.age <= 6 and data.screen_minutes < 60:
         return {"guidance": quick_guidance}
-    
-    # 3️⃣ Run OpenAI in background (non-blocking)
+
+    if data.age > 6 and data.screen_minutes < 45:
+        return {"guidance": quick_guidance}
+
+    # --------------------------------------------------
+    # Run AI asynchronously
+    # --------------------------------------------------
+
     threading.Thread(
         target=generate_ai_guidance_async,
         args=(entry.id, data),
         daemon=True,
     ).start()
 
-    # 4️⃣ Respond instantly
     return {"guidance": quick_guidance}
+
+
+@app.get("/history", response_model=List[HistoryItem])
+def get_history():
+    db = SessionLocal()
+    entries = (
+        db.query(DailyEntry)
+        .order_by(DailyEntry.entry_date.desc())
+        .limit(7)
+        .all()
+    )
+    db.close()
+    return entries
+
+
+# --------------------------------------------------
+# 🔔 History auto-refresh stream (SSE)
+# --------------------------------------------------
+
+@app.get("/history/stream")
+def history_stream():
+    def event_generator():
+        global history_updated
+        while True:
+            if history_updated:
+                history_updated = False
+                yield "data: updated\n\n"
+            time.sleep(1)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream"
+    )
+
+
+# --------------------------------------------------
+# Background AI worker
+# --------------------------------------------------
+
 def generate_ai_guidance_async(entry_id: int, data: DailyGuidanceRequest):
     try:
         response = client.responses.create(
@@ -110,20 +192,9 @@ def generate_ai_guidance_async(entry_id: int, data: DailyGuidanceRequest):
         if entry:
             entry.guidance = ai_text
             db.commit()
+            notify_history_update()
 
         db.close()
 
     except Exception as e:
         print("AI background task failed:", e)
-@app.get("/history", response_model=List[HistoryItem])
-def get_history():
-    db = SessionLocal()
-    entries = (
-        db.query(DailyEntry)
-        .order_by(DailyEntry.entry_date.desc())
-        .limit(7)
-        .all()
-    )
-    db.close()
-    return entries
-
